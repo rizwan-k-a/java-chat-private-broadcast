@@ -1,0 +1,387 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    KEY CODE SNIPPETS - SYNCHRONIZATION
+═══════════════════════════════════════════════════════════════════════════════
+
+
+📌 1. SERVER THREAD SYNCHRONIZATION (ChatServer.java)
+─────────────────────────────────────────────────────────────────────────────
+
+Concurrent Client Storage:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ private ConcurrentHashMap<String, ClientHandler> clients;                   │
+│ private ReentrantLock lock;                                                  │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ Thread-safe client registration/removal                                  │
+│ ✓ No lost updates when multiple threads access simultaneously               │
+│ ✓ Atomic get-modify-put operations                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+Synchronized Message Broadcasting:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ public void broadcastMessage(String message, String sender) {               │
+│     lock.lock();                                                             │
+│     try {                                                                    │
+│         String timestamp = LocalTime.now().format(timeFormatter);           │
+│         String formattedMessage = "[" + timestamp + "] " + sender +        │
+│                                   ": " + message;                           │
+│                                                                              │
+│         logToConsole(formattedMessage);                                      │
+│         messageHistory.add(formattedMessage);  // thread-safe list          │
+│         totalMessages++;                       // atomic increment           │
+│                                                                              │
+│         // Critical section: Send to ALL clients atomically                 │
+│         for (ClientHandler client : clients.values()) {                    │
+│             client.sendMessage(formattedMessage);                           │
+│         }                                                                    │
+│         updateStats();                                                       │
+│     } finally {                                                              │
+│         lock.unlock();                                                       │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ No partial message broadcasts                                            │
+│ ✓ All clients receive message atomically                                   │
+│ ✓ Message history stays consistent                                         │
+│ ✓ Stats counter never corrupted                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+Synchronized Active Users Broadcast:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ public void broadcastActiveUsers() {                                         │
+│     lock.lock();                                                             │
+│     try {                                                                    │
+│         Set<String> activeUsers = clients.keySet();                         │
+│         StringBuilder userList = new StringBuilder();                        │
+│                                                                              │
+│         for (String user : activeUsers) {                                   │
+│             if (userList.length() > 0) userList.append(", ");              │
+│             userList.append(user);                                          │
+│         }                                                                    │
+│                                                                              │
+│         String activeUsersMessage = "=== ACTIVE USERS (" +                │
+│             activeUsers.size() + "): " + userList.toString() + " ===";     │
+│         logToConsole(activeUsersMessage);                                    │
+│                                                                              │
+│         // Send to ALL clients atomically                                   │
+│         for (ClientHandler client : clients.values()) {                    │
+│             client.sendActiveUsers(new ArrayList<>(activeUsers));          │
+│         }                                                                    │
+│     } finally {                                                              │
+│         lock.unlock();                                                       │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ All clients get consistent user list                                     │
+│ ✓ No partial/stale user lists sent                                         │
+│ ✓ Atomic snapshot of active clients                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+ClientHandler - Per-Client Thread:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ public class ClientHandler extends Thread {                                  │
+│     private Socket socket;                                                   │
+│     private String username;                                                 │
+│     private BufferedReader in;                                              │
+│     private PrintWriter out;                                                │
+│     private volatile boolean isActive = true;  // volatile for visibility   │
+│                                                                              │
+│     @Override                                                                │
+│     public void run() {                                                      │
+│         try {                                                                │
+│             String message;                                                  │
+│             // Each client handled in its own thread                        │
+│             while (isActive && (message = in.readLine()) != null) {        │
+│                 if (message.startsWith("EXIT")) break;                      │
+│                 // Broadcast using synchronized method                      │
+│                 broadcastMessage(message, username);                        │
+│             }                                                                │
+│         } catch (IOException e) {                                           │
+│             // Client disconnected                                           │
+│         } finally {                                                          │
+│             disconnect();  // Cleanup                                        │
+│         }                                                                    │
+│     }                                                                        │
+│                                                                              │
+│     private void disconnect() {                                              │
+│         isActive = false;                                                    │
+│         try {                                                                │
+│             socket.close();                                                  │
+│             in.close();                                                      │
+│             out.close();                                                     │
+│         } catch (IOException e) { }                                         │
+│         removeClient(username);  // Synchronized removal                    │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ Each client handled concurrently without blocking others                 │
+│ ✓ Proper resource cleanup on disconnect                                    │
+│ ✓ volatile flag ensures other threads see disconnect                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+
+📌 2. CLIENT THREAD SYNCHRONIZATION (ChatClient.java)
+─────────────────────────────────────────────────────────────────────────────
+
+Client-Side Lock for Message Sending:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ private ReentrantLock lock;                                                  │
+│ private volatile boolean connected = false;                                 │
+│                                                                              │
+│ private void sendMessage() {                                                 │
+│     if (!connected) return;  // Check connection status (volatile read)      │
+│                                                                              │
+│     String message = messageInput.getText().trim();                         │
+│     if (!message.isEmpty()) {                                                │
+│         lock.lock();                                                         │
+│         try {                                                                │
+│             out.println(message);              // Critical section           │
+│             messageInput.setText("");          // UI update in lock         │
+│         } finally {                                                          │
+│             lock.unlock();                                                   │
+│         }                                                                    │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ No two threads send simultaneously (corrupting stream)                    │
+│ ✓ Message input field only cleared after sending                           │
+│ ✓ No race between connected check and send                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+Thread-Safe Table Updates:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ private void addMessageToTable(String time, String user, String message) {  │
+│     lock.lock();                                                             │
+│     try {                                                                    │
+│         tableModel.addRow(new Object[]{time, user, message});              │
+│         int lastRow = chatTable.getRowCount() - 1;                          │
+│         chatTable.scrollRectToVisible(chatTable.getCellRect(lastRow,      │
+│                                       0, true));                            │
+│     } finally {                                                              │
+│         lock.unlock();                                                       │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ Table model updated atomically                                           │
+│ ✓ Scroll position consistent with last row                                 │
+│ ✓ No incomplete row additions                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+Thread-Safe GUI Updates via EDT:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ private void updateActiveUsers(int count, String userList) {               │
+│     SwingUtilities.invokeLater(() -> {  // Run on EDT (Event Dispatch Thread)│
+│         activeUsersLabel.setText("Active Users (" + count + "): " +        │
+│                                  userList);                                 │
+│     });                                                                      │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ All GUI updates on single EDT thread                                     │
+│ ✓ No concurrent modifications to GUI components                            │
+│ ✓ No race conditions in Swing                                              │
+│ ✓ GUI remains responsive                                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+MessageListener - Async Message Reception:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ private class MessageListener extends Thread {                              │
+│     @Override                                                                │
+│     public void run() {                                                      │
+│         try {                                                                │
+│             String message;                                                  │
+│             // Runs in separate thread, doesn't block UI                    │
+│             while (connected && (message = in.readLine()) != null) {       │
+│                 final String receivedMessage = message;                     │
+│                                                                              │
+│                 // Handle active users update                               │
+│                 if (receivedMessage.startsWith("USERS:")) {                │
+│                     String[] parts = receivedMessage.split(":", 3);         │
+│                     if (parts.length == 3) {                                │
+│                         int userCount = Integer.parseInt(parts[1]);         │
+│                         String users = parts[2].isEmpty() ? "None" :        │
+│                                         parts[2].replace(",", ", ");        │
+│                         updateActiveUsers(userCount, users);                │
+│                     }                                                        │
+│                 }                                                            │
+│                                                                              │
+│                 // Handle regular messages                                  │
+│                 else if (receivedMessage.startsWith("[")) {                 │
+│                     // Parse: [HH:mm:ss] Username: Message                 │
+│                     int closeIdx = receivedMessage.indexOf("]");            │
+│                     if (closeIdx > 0) {                                     │
+│                         String time = receivedMessage.substring(1,         │
+│                                       closeIdx);                            │
+│                         String rest = receivedMessage.substring(          │
+│                                       closeIdx + 2);                        │
+│                         int colonIdx = rest.indexOf(": ");                  │
+│                         if (colonIdx > 0) {                                 │
+│                             String user = rest.substring(0, colonIdx);      │
+│                             String msg = rest.substring(colonIdx + 2);      │
+│                             addMessageToTable(time, user, msg);            │
+│                         }                                                    │
+│                     }                                                        │
+│                 }                                                            │
+│             }                                                                │
+│         } catch (IOException e) {                                           │
+│             // Connection closed                                             │
+│         } finally {                                                          │
+│             // Cleanup on disconnect                                         │
+│             connected = false;                                              │
+│             SwingUtilities.invokeLater(() -> {                              │
+│                 statusLabel.setText("Status: Disconnected");               │
+│                 messageInput.setEnabled(false);                             │
+│             });                                                              │
+│         }                                                                    │
+│     }                                                                        │
+│ }                                                                            │
+│                                                                              │
+│ This ensures:                                                               │
+│ ✓ Message receiving doesn't block UI (separate thread)                     │
+│ ✓ Multiple messages processed concurrently                                 │
+│ ✓ GUI updates always on EDT                                                │
+│ ✓ Proper cleanup on disconnection                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+
+📌 3. SYNCHRONIZATION MECHANISMS SUMMARY
+─────────────────────────────────────────────────────────────────────────────
+
+1. ReentrantLock (Explicit Locking)
+   Usage: Critical sections with complex logic
+   Example: broadcastMessage(), sendMessage()
+   Benefit: Fine-grained control, multiple tries possible
+
+2. ConcurrentHashMap (Concurrent Collections)
+   Usage: Concurrent read/write to client map
+   Example: clients.put(), clients.values(), clients.remove()
+   Benefit: No explicit locking needed for these ops
+
+3. Collections.synchronizedList (Synchronized Collections)
+   Usage: Message history
+   Example: messageHistory.add()
+   Benefit: Thread-safe list operations
+
+4. volatile boolean (Memory Visibility)
+   Usage: Connection flags
+   Example: connected, running, isActive
+   Benefit: Ensures visibility across threads
+
+5. SwingUtilities.invokeLater() (Event Dispatch Thread)
+   Usage: All GUI updates
+   Example: statusLabel.setText(), addMessageToTable()
+   Benefit: GUI thread safety, no race conditions
+
+6. Try-Finally Blocks (Resource Management)
+   Usage: Lock release, socket closure
+   Example: lock.lock(); try { ... } finally { lock.unlock(); }
+   Benefit: Ensures cleanup even if exception occurs
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+
+📌 4. THREAD EXECUTION FLOW
+─────────────────────────────────────────────────────────────────────────────
+
+SERVER SIDE:
+────────────
+Main Thread (Main Method)
+  └─ SwingUtilities.invokeLater(() -> new ChatServer())
+       └─ ChatServer constructor
+            ├─ setupGUI()          → Creates GUI on EDT
+            └─ startServer()
+                 └─ New Thread (accepts connections)
+                      └─ while(running) ServerSocket.accept()
+                           ├─ New Thread (Client1)
+                           │    └─ ClientHandler1.run()
+                           │         └─ while(connected) readLine()
+                           │              └─ broadcastMessage() [LOCKED]
+                           │
+                           ├─ New Thread (Client2)
+                           │    └─ ClientHandler2.run()
+                           │         └─ while(connected) readLine()
+                           │              └─ broadcastMessage() [LOCKED]
+                           │
+                           └─ New Thread (Client3)
+                                └─ ClientHandler3.run()
+                                     └─ while(connected) readLine()
+                                          └─ broadcastMessage() [LOCKED]
+
+
+CLIENT SIDE:
+────────────
+Main Thread
+  └─ SwingUtilities.invokeLater(() -> new ChatClient())
+       └─ ChatClient constructor
+            ├─ setupGUI()        → Creates GUI on EDT
+            └─ connectToServer()
+                 └─ New Thread (connection setup)
+                      ├─ Username dialog
+                      ├─ Socket connection
+                      ├─ Send username to server
+                      │
+                      └─ New Thread (MessageListener)
+                           └─ while(connected) readLine()
+                                └─ Parse message
+                                     └─ SwingUtilities.invokeLater()
+                                          └─ addMessageToTable() [LOCKED]
+
+User Interface Thread (Event Dispatch Thread - EDT)
+  └─ Handles all GUI updates from SwingUtilities.invokeLater()
+  └─ Handles button clicks and key events
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+
+📌 5. RACE CONDITION PREVENTION
+─────────────────────────────────────────────────────────────────────────────
+
+Potential Race Condition 1: Concurrent Client List Modifications
+│ Server Thread A: clients.put("User1", handler1)
+│ Server Thread B: clients.values() [iterating for broadcast]
+│ Server Thread C: clients.remove("User2")
+└─ Solution: ReentrantLock protects broadcastMessage() + broadcastActiveUsers()
+   └─ ConcurrentHashMap handles atomic operations
+
+
+Potential Race Condition 2: Stream Corruption
+│ Client Thread A: out.println("Message A")
+│ Client Thread B: out.println("Message B")
+│ Result: Mixed: "Message A Message B" (corrupted)
+└─ Solution: ReentrantLock in sendMessage() prevents simultaneous writes
+
+
+Potential Race Condition 3: GUI Update During Table Modification
+│ MessageListener Thread: tableModel.addRow()
+│ User Input Thread: messageInput.setText("")
+│ EDT Thread: Rendering table
+└─ Solution: SwingUtilities.invokeLater() + ReentrantLock in addMessageToTable()
+
+
+Potential Race Condition 4: Connection Flag Check
+│ Main Thread: if (!connected) return;
+│ MessageListener Thread: connected = false;
+│ Race: Check and send without connected becoming false
+└─ Solution: volatile boolean ensures immediate visibility
+
+
+═══════════════════════════════════════════════════════════════════════════════
